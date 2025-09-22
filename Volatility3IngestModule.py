@@ -1,7 +1,7 @@
-﻿
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import os
 import sys
+import json
 import inspect
 import threading
 import time
@@ -20,7 +20,7 @@ from java.awt.event import ActionListener
 
 from org.sleuthkit.autopsy.ingest import (IngestModuleFactoryAdapter, DataSourceIngestModule,
                                           IngestModuleIngestJobSettings, IngestModuleIngestJobSettingsPanel,
-                                          IngestModuleException, IngestServices, IngestMessage)
+                                          IngestServices, IngestMessage, IngestModule)
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.autopsy.coreutils import Logger
 
@@ -28,8 +28,10 @@ MODULE_NAME = "Volatility 3 Ingest Module"
 MODULE_VERSION = "1.0"
 OS_WINDOWS = "windows"
 OS_LINUX = "linux"
+IngestModuleException = IngestModule.IngestModuleException
 OS_MAC = "mac"
 CASE_MODULE_OUTPUT_TOKEN = "CASE_MODULE_OUTPUT"
+SETTINGS_LOGGER = Logger.getLogger("Vol3JobSettings")
 
 OS_DETECTION_SEQUENCE = [
     (OS_WINDOWS, "windows.info", "json"),
@@ -51,21 +53,27 @@ class Vol3Config(object):
         self.logger = logger
         self.config_path = config_path
         self.sections = {}
-        self.loaded = False
 
     def load(self):
         self.sections = {}
         config_file = File(self.config_path)
         if not config_file.exists():
             self.logger.log(Level.WARNING, "Configuration file not found: " + config_file.getAbsolutePath())
-            self.loaded = False
             return
-        input_stream = None
+        stream = None
         reader = None
         try:
-            input_stream = FileInputStream(config_file)
-            reader = BufferedReader(InputStreamReader(input_stream, "UTF-8"))
-            current_section = None
+            if self.logger is not None:
+                try:
+                    cmd_desc = []
+                    for i in range(args.size()):
+                        cmd_desc.append(str(args.get(i)))
+                    self.logger.log(Level.INFO, "Executing command: " + " ".join(cmd_desc))
+                except Exception:
+                    pass
+            stream = FileInputStream(config_file)
+            reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+            current = None
             while True:
                 line = reader.readLine()
                 if line is None:
@@ -74,30 +82,28 @@ class Vol3Config(object):
                 if len(text) == 0 or text.startswith("#") or text.startswith(";"):
                     continue
                 if text.startswith("[") and text.endswith("]"):
-                    current_section = text[1:-1].strip().lower()
-                    if current_section not in self.sections:
-                        self.sections[current_section] = {}
+                    current = text[1:-1].strip().lower()
+                    if current not in self.sections:
+                        self.sections[current] = {}
                 else:
-                    if current_section is None:
+                    if current is None:
                         continue
                     parts = text.split("=", 1)
                     if len(parts) == 2:
                         key = parts[0].strip().lower()
                         value = parts[1].strip()
-                        self.sections[current_section][key] = value
-            self.loaded = True
+                        self.sections[current][key] = value
         except Exception as ex:
             self.logger.log(Level.SEVERE, "Failed to load config.ini: " + str(ex))
-            self.loaded = False
         finally:
             if reader is not None:
                 try:
                     reader.close()
                 except Exception:
                     pass
-            if input_stream is not None:
+            if stream is not None:
                 try:
-                    input_stream.close()
+                    stream.close()
                 except Exception:
                     pass
 
@@ -112,15 +118,15 @@ class Vol3Config(object):
 
     def get_list(self, section, key):
         value = self.get(section, key, "")
-        if value is None:
+        if value is None or len(value) == 0:
             return []
-        raw = value.split(",")
-        result = []
-        for entry in raw:
-            item = entry.strip()
-            if len(item) > 0:
-                result.append(item)
-        return result
+        parts = value.split(",")
+        items = []
+        for part in parts:
+            entry = part.strip()
+            if len(entry) > 0:
+                items.append(entry)
+        return items
 
     def get_int(self, section, key, default_value):
         value = self.get(section, key, None)
@@ -131,6 +137,7 @@ class Vol3Config(object):
         except Exception:
             self.logger.log(Level.WARNING, "Invalid integer for [{0}] {1}: {2}".format(section, key, value))
             return default_value
+
 
 class PluginExecutionResult(object):
     def __init__(self):
@@ -153,11 +160,10 @@ class _ProcessWaitCallable(Callable):
 
 
 class _StreamCollector(object):
-    def __init__(self, input_stream, target_path, max_bytes, always_create, append_mode):
+    def __init__(self, input_stream, target_path, max_bytes, append_mode):
         self.input_stream = input_stream
         self.target_path = target_path
         self.max_bytes = max_bytes
-        self.always_create = always_create
         self.append_mode = append_mode
         self.truncated = False
         self.error = None
@@ -171,16 +177,16 @@ class _StreamCollector(object):
                 parent = file_obj.getParentFile()
                 if parent is not None and not parent.exists():
                     parent.mkdirs()
-                fos = FileOutputStream(file_obj, self.append_mode)
-                writer = BufferedWriter(OutputStreamWriter(fos, "UTF-8"))
+                writer = BufferedWriter(OutputStreamWriter(FileOutputStream(file_obj, self.append_mode), "UTF-8"))
             reader = BufferedReader(InputStreamReader(self.input_stream, "UTF-8"))
-            bytes_consumed = 0
+            total = 0
             while True:
                 line = reader.readLine()
                 if line is None:
                     break
-                bytes_consumed += len((line + "\n").encode("UTF-8"))
-                if self.max_bytes > 0 and bytes_consumed > self.max_bytes:
+                encoded = (line + "\n").encode("UTF-8")
+                total += len(encoded)
+                if self.max_bytes > 0 and total > self.max_bytes:
                     self.truncated = True
                     if writer is not None:
                         writer.write(u"[vol3] Output truncated (exceeded configured limit)\n")
@@ -190,7 +196,7 @@ class _StreamCollector(object):
                     break
                 if writer is not None:
                     writer.write(line)
-                    writer.write(u"\n")
+                    writer.write("\n")
             if writer is not None:
                 writer.flush()
         except Exception as ex:
@@ -220,7 +226,7 @@ class Vol3Runner(object):
         self.timeout_sec = timeout_sec
         self.max_stdout_bytes = max_stdout_bytes
 
-    def run_plugin(self, dump_path, plugin_name, renderer, stdout_path, stderr_path, timeout_sec, cancel_check, append_stdout=False, append_stderr=False):
+    def run_plugin(self, dump_path, plugin_name, renderer, stdout_path, stderr_path, timeout_sec, cancel_check):
         args = ArrayList()
         args.add(self.python_exe)
         args.add(self.volatility_exe)
@@ -229,9 +235,7 @@ class Vol3Runner(object):
         args.add(plugin_name)
         args.add("--renderer")
         args.add(renderer)
-        return self._execute(args, stdout_path, stderr_path, timeout_sec, cancel_check,
-                             stdout_path is not None, stderr_path is not None,
-                             append_stdout, append_stderr)
+        return self._execute(args, stdout_path, stderr_path, timeout_sec, cancel_check)
 
     def run_detection(self, dump_path, plugin_name, renderer, timeout_sec, cancel_check):
         args = ArrayList()
@@ -242,14 +246,14 @@ class Vol3Runner(object):
         args.add(plugin_name)
         args.add("--renderer")
         args.add(renderer)
-        return self._execute(args, None, None, timeout_sec, cancel_check, False, False, False, False)
+        return self._execute(args, None, None, timeout_sec, cancel_check)
 
     def verify_binaries(self):
         args = ArrayList()
         args.add(self.python_exe)
         args.add(self.volatility_exe)
         args.add("--help")
-        result = self._execute(args, None, None, 30, None, False, False, False, False)
+        result = self._execute(args, None, None, 30, None)
         if result.error is not None:
             raise Exception("Volatility --help failed: " + result.error)
         if result.timed_out:
@@ -262,31 +266,25 @@ class Vol3Runner(object):
         args.add(self.python_exe)
         args.add(self.volatility_exe)
         args.add("--info")
-        stdout_temp = None
-        stderr_temp = None
+        stdout_tmp = File.createTempFile("vol3_plugins", ".txt")
+        stderr_tmp = File.createTempFile("vol3_plugins_err", ".txt")
+        stdout_tmp.deleteOnExit()
+        stderr_tmp.deleteOnExit()
         try:
-            stdout_temp = File.createTempFile("vol3_plugins", ".txt")
-            stderr_temp = File.createTempFile("vol3_plugins_err", ".txt")
-            stdout_temp.deleteOnExit()
-            stderr_temp.deleteOnExit()
-            result = self._execute(args, stdout_temp.getAbsolutePath(), stderr_temp.getAbsolutePath(), timeout_sec, None, True, True, False, False)
-            output = self._read_text_file(stdout_temp)
-            error_output = self._read_text_file(stderr_temp)
+            result = self._execute(args, stdout_tmp.getAbsolutePath(), stderr_tmp.getAbsolutePath(), timeout_sec, None)
+            output = self._read_text_file(stdout_tmp)
+            error_output = self._read_text_file(stderr_tmp)
             return (result, output, error_output)
         finally:
-            if stdout_temp is not None:
-                stdout_temp.delete()
-            if stderr_temp is not None:
-                stderr_temp.delete()
+            stdout_tmp.delete()
+            stderr_tmp.delete()
 
     def _read_text_file(self, file_obj):
-        target = None
-        if file_obj is None:
+        target = file_obj
+        if target is None:
             return ""
-        if isinstance(file_obj, File):
-            target = file_obj
-        else:
-            target = File(str(file_obj))
+        if not isinstance(target, File):
+            target = File(str(target))
         if not target.exists():
             return ""
         reader = None
@@ -310,49 +308,53 @@ class Vol3Runner(object):
                 except Exception:
                     pass
 
-    def _execute(self, args, stdout_path, stderr_path, timeout_sec, cancel_check,
-                 create_stdout, create_stderr, append_stdout, append_stderr):
+    def _execute(self, args, stdout_path, stderr_path, timeout_sec, cancel_check):
         result = PluginExecutionResult()
         result.stdout_path = stdout_path
         result.stderr_path = stderr_path
         if timeout_sec is None or timeout_sec <= 0:
             timeout_sec = self.timeout_sec
+        if self.logger is not None:
+            try:
+                cmd_desc = []
+                for i in range(args.size()):
+                    cmd_desc.append(str(args.get(i)))
+                self.logger.log(Level.INFO, "Executing command: " + " ".join(cmd_desc))
+            except Exception:
+                pass
         process = None
         executor = None
         future = None
-        stdout_thread = None
-        stderr_thread = None
         stdout_collector = None
         stderr_collector = None
+        stdout_thread = None
+        stderr_thread = None
         try:
             builder = ProcessBuilder(args)
             process = builder.start()
-            stdout_collector = _StreamCollector(process.getInputStream(), stdout_path, self.max_stdout_bytes, create_stdout, append_stdout)
-            stderr_collector = _StreamCollector(process.getErrorStream(), stderr_path, self.max_stdout_bytes, create_stderr, append_stderr)
+            stdout_collector = _StreamCollector(process.getInputStream(), stdout_path, self.max_stdout_bytes, False)
+            stderr_collector = _StreamCollector(process.getErrorStream(), stderr_path, self.max_stdout_bytes, False)
             stdout_thread = threading.Thread(target=stdout_collector.run, name="vol3-stdout")
-            stdout_thread.setDaemon(True)
-            stdout_thread.start()
             stderr_thread = threading.Thread(target=stderr_collector.run, name="vol3-stderr")
+            stdout_thread.setDaemon(True)
             stderr_thread.setDaemon(True)
+            stdout_thread.start()
             stderr_thread.start()
 
             executor = Executors.newSingleThreadExecutor()
             future = executor.submit(_ProcessWaitCallable(process))
-            deadline = -1
-            if timeout_sec > 0:
-                deadline = long(time.time() * 1000) + (timeout_sec * 1000)
+            deadline = time.time() + timeout_sec
             exit_code = None
-            completed = False
-            while not completed:
+            while True:
                 if cancel_check is not None and cancel_check():
                     result.cancelled = True
                     process.destroyForcibly()
                     break
                 try:
                     exit_code = future.get(1, TimeUnit.SECONDS)
-                    completed = True
+                    break
                 except TimeoutException:
-                    if timeout_sec > 0 and deadline > 0 and long(time.time() * 1000) > deadline:
+                    if timeout_sec > 0 and time.time() > deadline:
                         result.timed_out = True
                         process.destroyForcibly()
                         break
@@ -362,8 +364,6 @@ class Vol3Runner(object):
                     break
             if exit_code is not None:
                 result.exit_code = exit_code
-            else:
-                result.exit_code = -1
             if future is not None:
                 future.cancel(True)
         except IOException as ioex:
@@ -390,10 +390,16 @@ class Vol3Runner(object):
                 result.stderr_truncated = stderr_collector.truncated
                 if stderr_collector.error is not None:
                     result.error = stderr_collector.error
+        if self.logger is not None:
+            try:
+                self.logger.log(Level.INFO, "Command exit code: {0}".format(result.exit_code))
+            except Exception:
+                pass
         return result
 
 class Vol3JobSettings(IngestModuleIngestJobSettings):
     VERSION_NUMBER = 1
+    serialVersionUID = 1
 
     def __init__(self):
         self._selected_plugins = {
@@ -420,7 +426,9 @@ class Vol3JobSettings(IngestModuleIngestJobSettings):
     def getAllSelectedPlugins(self):
         result = []
         for os_key in self._selected_plugins:
-            result.extend(self._selected_plugins[os_key])
+            for item in self._selected_plugins[os_key]:
+                if item not in result:
+                    result.append(item)
         return result
 
     def setPythonExe(self, path):
@@ -450,6 +458,44 @@ class Vol3JobSettings(IngestModuleIngestJobSettings):
     def getReportsRoot(self):
         return self._reports_root
 
+    def serialize(self):
+        payload = {
+            "python_exe": self._python_exe,
+            "vol_exe": self._vol_exe,
+            "reports_root": self._reports_root,
+            "selected_plugins": self._selected_plugins
+        }
+        try:
+            return json.dumps(payload)
+        except Exception as ex:
+            SETTINGS_LOGGER.log(Level.WARNING, "Failed to serialize job settings: " + str(ex))
+            return "{}"
+
+    def deserialize(self, serialized):
+        if serialized is None or len(serialized) == 0:
+            return
+        try:
+            data = json.loads(serialized)
+        except Exception as ex:
+            SETTINGS_LOGGER.log(Level.WARNING, "Failed to deserialize job settings: " + str(ex))
+            return
+        try:
+            self._python_exe = data.get("python_exe", "")
+            self._vol_exe = data.get("vol_exe", "")
+            self._reports_root = data.get("reports_root", "")
+            selected = data.get("selected_plugins", {})
+            if isinstance(selected, dict):
+                for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
+                    plugins = selected.get(os_key, [])
+                    if isinstance(plugins, list):
+                        cleaned = []
+                        for item in plugins:
+                            if item is not None:
+                                cleaned.append(str(item))
+                        self._selected_plugins[os_key] = cleaned
+        except Exception as ex:
+            SETTINGS_LOGGER.log(Level.WARNING, "Error applying deserialized settings: " + str(ex))
+
 
 class Vol3PluginPlan(object):
     def __init__(self, config, settings):
@@ -470,42 +516,42 @@ class Vol3PluginPlan(object):
             selected = self.settings.getSelectedPlugins(detected_os)
             if selected is None or len(selected) == 0:
                 selected = self._default_plugins(detected_os)
-            return self._normalize(selected)
-        union = []
+            return self._dedupe(selected)
+        combined = []
         for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
             selected = self.settings.getSelectedPlugins(os_key)
             if selected is None or len(selected) == 0:
                 selected = self._default_plugins(os_key)
             for item in selected:
-                if item not in union:
-                    union.append(item)
-        return union
+                if item not in combined:
+                    combined.append(item)
+        return combined
 
-    def _normalize(self, items):
-        seen = []
-        for item in items:
-            if item not in seen:
-                seen.append(item)
-        return seen
+    def _dedupe(self, plugins):
+        result = []
+        for item in plugins:
+            if item not in result:
+                result.append(item)
+        return result
 
 class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
     def __init__(self, settings, config, logger):
         IngestModuleIngestJobSettingsPanel.__init__(self)
         self.logger = logger
         self.config = config
-        self.originalSettings = settings
-        self.availablePlugins = {
+        self.original_settings = settings
+        self.available_plugins = {
             OS_WINDOWS: self.config.get_list("plugins.win", "whitelist"),
             OS_LINUX: self.config.get_list("plugins.lin", "whitelist"),
             OS_MAC: self.config.get_list("plugins.mac", "whitelist")
         }
-        self.pluginCheckboxes = {
+        self.plugin_checkboxes = {
             OS_WINDOWS: [],
             OS_LINUX: [],
             OS_MAC: []
         }
-        self.pluginPanels = {}
-        self.statusLabel = JLabel(" ")
+        self.plugin_panels = {}
+        self.status_label = JLabel(" ")
         self.default_timeout = self.config.get_int("limits", "timeout_sec_per_plugin", 600)
         max_mb = self.config.get_int("limits", "max_stdout_mb", 64)
         if max_mb <= 0:
@@ -518,51 +564,47 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
         self.setLayout(BorderLayout(10, 10))
         self.setBorder(EmptyBorder(10, 10, 10, 10))
 
-        pathsPanel = JPanel(GridBagLayout())
+        paths_panel = JPanel(GridBagLayout())
+        self.python_field = JTextField(30)
+        self.vol_field = JTextField(30)
+        self.reports_field = JTextField(30)
 
-        self.pythonField = JTextField(30)
-        self.volField = JTextField(30)
-        self.reportsField = JTextField(30)
+        self._add_path_row(paths_panel, 0, "Python executable:", self.python_field, False)
+        self._add_path_row(paths_panel, 1, "Volatility script:", self.vol_field, False)
+        self._add_path_row(paths_panel, 2, "Reports root:", self.reports_field, True)
 
-        self._add_path_row(pathsPanel, 0, "Python executable:", self.pythonField, False)
-        self._add_path_row(pathsPanel, 1, "Volatility script:", self.volField, False)
-        self._add_path_row(pathsPanel, 2, "Reports root:", self.reportsField, True)
+        self.add(paths_panel, BorderLayout.NORTH)
 
-        self.add(pathsPanel, BorderLayout.NORTH)
-
-        pluginsContainer = JPanel()
-        pluginsContainer.setLayout(BoxLayout(pluginsContainer, BoxLayout.Y_AXIS))
-
+        plugins_container = JPanel()
+        plugins_container.setLayout(BoxLayout(plugins_container, BoxLayout.Y_AXIS))
         for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
             panel = JPanel()
             panel.setLayout(BoxLayout(panel, BoxLayout.Y_AXIS))
-            title = os_key.capitalize() + " plugins"
-            panel.setBorder(TitledBorder(title))
-            pluginsContainer.add(panel)
-            self.pluginPanels[os_key] = panel
-
-        scroll = JScrollPane(pluginsContainer)
+            panel.setBorder(TitledBorder(os_key.capitalize() + " plugins"))
+            plugins_container.add(panel)
+            self.plugin_panels[os_key] = panel
+        scroll = JScrollPane(plugins_container)
         scroll.setBorder(TitledBorder("Volatility 3 plugins"))
         self.add(scroll, BorderLayout.CENTER)
 
-        bottomPanel = JPanel()
-        bottomPanel.setLayout(BorderLayout(5, 5))
-        refreshButton = JButton("Refresh plugins")
-        refreshButton.addActionListener(self._create_refresh_action())
-        bottomPanel.add(refreshButton, BorderLayout.WEST)
-        bottomPanel.add(self.statusLabel, BorderLayout.CENTER)
-        self.add(bottomPanel, BorderLayout.SOUTH)
-    def _add_path_row(self, panel, row_index, label_text, text_field, directories_only):
+        bottom = JPanel(BorderLayout(5, 5))
+        refresh = JButton("Refresh plugins")
+        refresh.addActionListener(self._create_refresh_action())
+        bottom.add(refresh, BorderLayout.WEST)
+        bottom.add(self.status_label, BorderLayout.CENTER)
+        self.add(bottom, BorderLayout.SOUTH)
+
+    def _add_path_row(self, panel, index, label_text, text_field, directories_only):
         label_constraints = GridBagConstraints()
         label_constraints.gridx = 0
-        label_constraints.gridy = row_index
+        label_constraints.gridy = index
         label_constraints.anchor = GridBagConstraints.WEST
         label_constraints.insets = Insets(4, 4, 4, 4)
         panel.add(JLabel(label_text), label_constraints)
 
         field_constraints = GridBagConstraints()
         field_constraints.gridx = 1
-        field_constraints.gridy = row_index
+        field_constraints.gridy = index
         field_constraints.weightx = 1.0
         field_constraints.fill = GridBagConstraints.HORIZONTAL
         field_constraints.insets = Insets(4, 4, 4, 4)
@@ -570,7 +612,7 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
 
         button_constraints = GridBagConstraints()
         button_constraints.gridx = 2
-        button_constraints.gridy = row_index
+        button_constraints.gridy = index
         button_constraints.insets = Insets(4, 4, 4, 4)
         browse = JButton("Browse")
         browse.addActionListener(self._create_file_action(text_field, directories_only))
@@ -586,9 +628,9 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
                     chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY)
                 else:
                     chooser.setFileSelectionMode(JFileChooser.FILES_ONLY)
-                current = text_field.getText().strip()
-                if len(current) > 0:
-                    chooser.setSelectedFile(File(current))
+                existing = text_field.getText().strip()
+                if len(existing) > 0:
+                    chooser.setSelectedFile(File(existing))
                 result = chooser.showOpenDialog(panel)
                 if result == JFileChooser.APPROVE_OPTION:
                     selected = chooser.getSelectedFile()
@@ -621,42 +663,44 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
         if reports_value is None or len(reports_value) == 0:
             reports_value = reports_default
 
-        self.pythonField.setText(python_value)
-        self.volField.setText(vol_value)
-        self.reportsField.setText(reports_value)
+        self.python_field.setText(python_value)
+        self.vol_field.setText(vol_value)
+        self.reports_field.setText(reports_value)
 
-        initial_selection = {}
+        selection_map = {}
         for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
             selected = settings.getSelectedPlugins(os_key)
             if selected is None or len(selected) == 0:
-                selected = self.availablePlugins.get(os_key, [])
-            initial_selection[os_key] = list(selected)
-        self._rebuild_checkboxes(initial_selection)
+                selected = self.available_plugins.get(os_key, [])
+            selection_map[os_key] = list(selected)
+        self._rebuild_checkboxes(selection_map)
 
     def _rebuild_checkboxes(self, selected_map):
         for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
-            panel = self.pluginPanels[os_key]
+            panel = self.plugin_panels[os_key]
             panel.removeAll()
-            self.pluginCheckboxes[os_key] = []
-            plugins = self.availablePlugins.get(os_key, [])
+            self.plugin_checkboxes[os_key] = []
+            plugins = self.available_plugins.get(os_key, [])
             for plugin in plugins:
                 checkbox = JCheckBox(plugin)
-                if selected_map is not None and os_key in selected_map and plugin in selected_map[os_key]:
+                if os_key in selected_map and plugin in selected_map[os_key]:
                     checkbox.setSelected(True)
                 panel.add(checkbox)
-                self.pluginCheckboxes[os_key].append(checkbox)
+                self.plugin_checkboxes[os_key].append(checkbox)
             panel.revalidate()
             panel.repaint()
 
     def _collect_selections(self):
-        mapping = {}
-        for os_key in self.pluginCheckboxes:
+        result = {}
+        for os_key in self.plugin_checkboxes:
             selected = []
-            for checkbox in self.pluginCheckboxes[os_key]:
+            checkboxes = self.plugin_checkboxes[os_key]
+            for checkbox in checkboxes:
                 if checkbox.isSelected():
                     selected.append(checkbox.getText())
-            mapping[os_key] = selected
-        return mapping
+            result[os_key] = selected
+        return result
+
     def _parse_plugins_from_text(self, text):
         if text is None:
             return []
@@ -676,8 +720,8 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
         return names
 
     def _refresh_plugins(self):
-        python_path = self.pythonField.getText().strip()
-        vol_path = self.volField.getText().strip()
+        python_path = self.python_field.getText().strip()
+        vol_path = self.vol_field.getText().strip()
         if len(python_path) == 0 or len(vol_path) == 0:
             self._set_status("Set python and Volatility paths before refresh", Level.WARNING)
             return
@@ -709,16 +753,16 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
                 new_map[OS_MAC].append(name)
         for os_key in new_map:
             if len(new_map[os_key]) == 0:
-                new_map[os_key] = self.availablePlugins.get(os_key, [])
+                new_map[os_key] = self.available_plugins.get(os_key, [])
         selections = self._collect_selections()
-        self.availablePlugins = new_map
+        self.available_plugins = new_map
         self._rebuild_checkboxes(selections)
         self._set_status("Plugin list refreshed", Level.INFO)
 
     def _set_status(self, message, level):
         if message is None:
             message = ""
-        self.statusLabel.setText(message)
+        self.status_label.setText(message)
         if level == Level.WARNING:
             self.logger.log(Level.WARNING, message)
         elif level == Level.SEVERE:
@@ -728,12 +772,12 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
 
     def getSettings(self):
         settings = Vol3JobSettings()
-        settings.setPythonExe(self.pythonField.getText().strip())
-        settings.setVolatilityExe(self.volField.getText().strip())
-        settings.setReportsRoot(self.reportsField.getText().strip())
-        for os_key in self.pluginCheckboxes:
+        settings.setPythonExe(self.python_field.getText().strip())
+        settings.setVolatilityExe(self.vol_field.getText().strip())
+        settings.setReportsRoot(self.reports_field.getText().strip())
+        for os_key in self.plugin_checkboxes:
             selected = []
-            for checkbox in self.pluginCheckboxes[os_key]:
+            for checkbox in self.plugin_checkboxes[os_key]:
                 if checkbox.isSelected():
                     selected.append(checkbox.getText())
             settings.setSelectedPlugins(os_key, selected)
@@ -798,9 +842,9 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             raise IngestModuleException("Python executable path is not configured")
         if vol_path is None or len(vol_path) == 0:
             raise IngestModuleException("Volatility script path is not configured")
-
         self.python_exe = python_path
         self.vol_exe = vol_path
+
         reports_root = self.settings.getReportsRoot()
         if reports_root is None or len(reports_root) == 0:
             reports_root = self.config.get("output", "reports_root", CASE_MODULE_OUTPUT_TOKEN)
@@ -824,6 +868,7 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             raise IngestModuleException("Unable to execute Volatility 3 (--help failed): " + str(ex))
 
         self.plugin_plan = Vol3PluginPlan(self.config, self.settings)
+
     def process(self, dataSource, progressBar):
         dump_path = dataSource.getLocalAbsPath()
         if dump_path is None:
@@ -859,11 +904,13 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             return DataSourceIngestModule.ProcessResult.OK
 
         total_steps = len(plugins) * 2
-        if total_steps <= 0:
-            progressBar.switchToIndeterminate()
-        else:
+        if total_steps > 0:
             progressBar.switchToDeterminate(total_steps)
+        else:
+            progressBar.switchToIndeterminate()
         current_step = 0
+        progressBar.progress("Initializing Volatility 3")
+        progressBar.progress(current_step)
         self.success_count = 0
         self.failure_count = 0
         self.timeout_count = 0
@@ -886,13 +933,18 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             self._reset_file(stderr_txt_tmp)
             self._reset_file(timeout_note)
 
+            self.logger.log(Level.INFO, "Preparing plugin {0}".format(plugin_name))
+            progressBar.progress("Preparing " + plugin_name)
             plugin_success = True
             plugin_timeout = False
 
+            self.logger.log(Level.INFO, "Running plugin {0} (jsonl)".format(plugin_name))
+            progressBar.progress("Running " + plugin_name + " (jsonl)")
             json_result = self.runner.run_plugin(dump_path, plugin_name, "jsonl", json_path, stderr_json_tmp, self.timeout_sec, self._is_cancelled)
             self._append_log(stderr_json_tmp, stderr_final, "[JSONL] " + plugin_name)
             current_step += 1
             progressBar.progress(current_step)
+            progressBar.progress("Completed " + plugin_name + " (jsonl)")
             if json_result.cancelled:
                 self.logger.log(Level.INFO, "Processing cancelled during plugin " + plugin_name)
                 return DataSourceIngestModule.ProcessResult.OK
@@ -907,10 +959,13 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 plugin_success = False
                 self.logger.log(Level.WARNING, "Error during plugin {0} (jsonl): {1}".format(plugin_name, json_result.error))
 
+            self.logger.log(Level.INFO, "Running plugin {0} (text)".format(plugin_name))
+            progressBar.progress("Running " + plugin_name + " (text)")
             txt_result = self.runner.run_plugin(dump_path, plugin_name, "text", txt_path, stderr_txt_tmp, self.timeout_sec, self._is_cancelled)
             self._append_log(stderr_txt_tmp, stderr_final, "[TEXT] " + plugin_name)
             current_step += 1
             progressBar.progress(current_step)
+            progressBar.progress("Completed " + plugin_name + " (text)")
             if txt_result.cancelled:
                 self.logger.log(Level.INFO, "Processing cancelled during plugin " + plugin_name)
                 return DataSourceIngestModule.ProcessResult.OK
@@ -925,19 +980,20 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 plugin_success = False
                 self.logger.log(Level.WARNING, "Error during plugin {0} (text): {1}".format(plugin_name, txt_result.error))
 
+            progressBar.progress("Finished " + plugin_name)
             if plugin_timeout:
                 self.timeout_count += 1
             if plugin_success:
                 self.success_count += 1
             else:
                 self.failure_count += 1
-
         summary = "Volatility 3 finished for {0}. Success: {1}, Failed: {2}, Timed out: {3}. Output: {4}".format(
             dataSource.getName(), self.success_count, self.failure_count, self.timeout_count,
             self.report_root_dir.getAbsolutePath())
         ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.DATA, MODULE_NAME, summary))
         self.logger.log(Level.INFO, summary)
         return DataSourceIngestModule.ProcessResult.OK
+
     def postProcess(self, progressBar):
         if self.report_root_dir is not None and self.report_root_dir.exists():
             Case.getCurrentCase().addReport(self.report_root_dir.getAbsolutePath(), MODULE_NAME, "Volatility 3 Report")
@@ -986,10 +1042,10 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
     def _sanitize_plugin_name(self, name):
         buffer = []
         for ch in name:
-            if ch.isalnum() or ch in ['.', '_', '-']:
+            if ch.isalnum() or ch in [".", "_", "-"]:
                 buffer.append(ch)
             else:
-                buffer.append('_')
+                buffer.append("_")
         return "".join(buffer)
 
     def _reset_file(self, path):
@@ -1103,6 +1159,21 @@ class Vol3IngestModuleFactory(IngestModuleFactoryAdapter):
 
     def createDataSourceIngestModule(self, settings):
         if settings is None or not isinstance(settings, Vol3JobSettings):
-            settings = Vol3JobSettings()
+            if settings is not None and hasattr(settings, "serialize"):
+                try:
+                    serialized = settings.serialize()
+                except Exception:
+                    serialized = None
+                new_settings = Vol3JobSettings()
+                if serialized is not None:
+                    try:
+                        new_settings.deserialize(serialized)
+                    except Exception:
+                        pass
+                settings = new_settings
+            else:
+                settings = Vol3JobSettings()
         return Vol3DataSourceIngestModule(settings)
+
+
 
