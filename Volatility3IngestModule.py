@@ -8,7 +8,6 @@ import time
 
 from java.io import File, FileInputStream, BufferedReader, InputStreamReader, FileOutputStream, OutputStreamWriter, BufferedWriter, IOException
 from java.lang import ProcessBuilder
-from java.util import ArrayList
 from java.util.logging import Level
 from java.util.concurrent import Executors, TimeUnit, TimeoutException, Callable
 
@@ -23,6 +22,11 @@ from org.sleuthkit.autopsy.ingest import (IngestModuleFactoryAdapter, DataSource
                                           IngestServices, IngestMessage, IngestModule)
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.autopsy.coreutils import Logger
+
+try:
+    unicode
+except NameError:
+    unicode = str
 
 MODULE_NAME = "Volatility 3 Ingest Module"
 MODULE_VERSION = "1.0"
@@ -63,14 +67,6 @@ class Vol3Config(object):
         stream = None
         reader = None
         try:
-            if self.logger is not None:
-                try:
-                    cmd_desc = []
-                    for i in range(args.size()):
-                        cmd_desc.append(str(args.get(i)))
-                    self.logger.log(Level.INFO, "Executing command: " + " ".join(cmd_desc))
-                except Exception:
-                    pass
             stream = FileInputStream(config_file)
             reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
             current = None
@@ -106,7 +102,6 @@ class Vol3Config(object):
                     stream.close()
                 except Exception:
                     pass
-
     def get(self, section, key, default_value):
         if section is None or key is None:
             return default_value
@@ -226,58 +221,40 @@ class Vol3Runner(object):
         self.timeout_sec = timeout_sec
         self.max_stdout_bytes = max_stdout_bytes
 
+    def _to_unicode(self, value):
+        if value is None:
+            return u""
+        if isinstance(value, unicode):
+            return value
+        return unicode(value)
+
     def run_plugin(self, dump_path, plugin_name, renderer, stdout_path, stderr_path, timeout_sec, cancel_check):
-        args = ArrayList()
-        args.add(self.python_exe)
-        args.add(self.volatility_exe)
-        args.add("-f")
-        args.add(str(dump_path))
-        args.add(plugin_name)
-        args.add("--renderer")
-        args.add(renderer)
-        return self._execute(args, stdout_path, stderr_path, timeout_sec, cancel_check)
+        cmd = [self._to_unicode(self.python_exe), self._to_unicode(self.volatility_exe), u'-f', self._to_unicode(dump_path), self._to_unicode(plugin_name), u'--renderer', self._to_unicode(renderer)]
+        return self._execute(cmd, stdout_path, stderr_path, timeout_sec, cancel_check)
 
     def run_detection(self, dump_path, plugin_name, renderer, timeout_sec, cancel_check):
-        args = ArrayList()
-        args.add(self.python_exe)
-        args.add(self.volatility_exe)
-        args.add("-f")
-        args.add(str(dump_path))
-        args.add(plugin_name)
-        args.add("--renderer")
-        args.add(renderer)
-        return self._execute(args, None, None, timeout_sec, cancel_check)
+        cmd = [self._to_unicode(self.python_exe), self._to_unicode(self.volatility_exe), u'-f', self._to_unicode(dump_path), self._to_unicode(plugin_name), u'--renderer', self._to_unicode(renderer)]
+        return self._execute(cmd, None, None, timeout_sec, cancel_check)
 
     def verify_binaries(self):
-        args = ArrayList()
-        args.add(self.python_exe)
-        args.add(self.volatility_exe)
-        args.add("--help")
-        result = self._execute(args, None, None, 30, None)
-        if result.error is not None:
-            raise Exception("Volatility --help failed: " + result.error)
-        if result.timed_out:
-            raise Exception("Volatility --help timed out")
-        if result.exit_code != 0:
-            raise Exception("Volatility --help returned exit code " + str(result.exit_code))
+        cmd = [self._to_unicode(self.python_exe), self._to_unicode(self.volatility_exe), u'--help']
+        result = self._execute(cmd, None, None, 30, None)
 
     def query_available_plugins(self, timeout_sec):
-        args = ArrayList()
-        args.add(self.python_exe)
-        args.add(self.volatility_exe)
-        args.add("--info")
+        cmd = [self._to_unicode(self.python_exe), self._to_unicode(self.volatility_exe), u'--info']
         stdout_tmp = File.createTempFile("vol3_plugins", ".txt")
         stderr_tmp = File.createTempFile("vol3_plugins_err", ".txt")
         stdout_tmp.deleteOnExit()
         stderr_tmp.deleteOnExit()
         try:
-            result = self._execute(args, stdout_tmp.getAbsolutePath(), stderr_tmp.getAbsolutePath(), timeout_sec, None)
+            result = self._execute(cmd, stdout_tmp.getAbsolutePath(), stderr_tmp.getAbsolutePath(), timeout_sec, None)
             output = self._read_text_file(stdout_tmp)
             error_output = self._read_text_file(stderr_tmp)
             return (result, output, error_output)
         finally:
             stdout_tmp.delete()
             stderr_tmp.delete()
+
 
     def _read_text_file(self, file_obj):
         target = file_obj
@@ -308,7 +285,7 @@ class Vol3Runner(object):
                 except Exception:
                     pass
 
-    def _execute(self, args, stdout_path, stderr_path, timeout_sec, cancel_check):
+    def _execute(self, cmd, stdout_path, stderr_path, timeout_sec, cancel_check):
         result = PluginExecutionResult()
         result.stdout_path = stdout_path
         result.stderr_path = stderr_path
@@ -316,10 +293,7 @@ class Vol3Runner(object):
             timeout_sec = self.timeout_sec
         if self.logger is not None:
             try:
-                cmd_desc = []
-                for i in range(args.size()):
-                    cmd_desc.append(str(args.get(i)))
-                self.logger.log(Level.INFO, "Executing command: " + " ".join(cmd_desc))
+                self.logger.log(Level.INFO, "Executing command: " + " ".join(cmd))
             except Exception:
                 pass
         process = None
@@ -330,7 +304,7 @@ class Vol3Runner(object):
         stdout_thread = None
         stderr_thread = None
         try:
-            builder = ProcessBuilder(args)
+            builder = ProcessBuilder(cmd)
             process = builder.start()
             stdout_collector = _StreamCollector(process.getInputStream(), stdout_path, self.max_stdout_bytes, False)
             stderr_collector = _StreamCollector(process.getErrorStream(), stderr_path, self.max_stdout_bytes, False)
@@ -844,6 +818,7 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             raise IngestModuleException("Volatility script path is not configured")
         self.python_exe = python_path
         self.vol_exe = vol_path
+        self.logger.log(Level.INFO, "Volatility runner configured: python={0}, vol={1}".format(self.python_exe, self.vol_exe))
 
         reports_root = self.settings.getReportsRoot()
         if reports_root is None or len(reports_root) == 0:
@@ -871,8 +846,16 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
 
     def process(self, dataSource, progressBar):
         dump_path = dataSource.getLocalAbsPath()
-        if dump_path is None:
-            self.logger.log(Level.SEVERE, "Data source does not have a local path")
+        self.logger.log(Level.INFO, "process() invoked for {0}, local path: {1}".format(dataSource.getName(), dump_path))
+        ingest_services = IngestServices.getInstance()
+        ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME, "Volatility module invoked for " + dataSource.getName()))
+        if dump_path is not None:
+            dump_file = File(dump_path)
+            if not dump_file.exists():
+                self.logger.log(Level.SEVERE, "Volatility input file not found: " + dump_path)
+                return DataSourceIngestModule.ProcessResult.ERROR
+        else:
+            self.logger.log(Level.SEVERE, "Data source returned null local path")
             return DataSourceIngestModule.ProcessResult.ERROR
 
         ingest_services = IngestServices.getInstance()
@@ -909,11 +892,17 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
         else:
             progressBar.switchToIndeterminate()
         current_step = 0
-        progressBar.progress("Initializing Volatility 3")
         progressBar.progress(current_step)
         self.success_count = 0
         self.failure_count = 0
         self.timeout_count = 0
+
+        plugin_list_log = ", ".join(plugins)
+        if self.logger is not None:
+            try:
+                self.logger.log(Level.INFO, "Planned plugins (" + str(len(plugins)) + "): " + plugin_list_log)
+            except Exception:
+                pass
 
         for plugin_name in plugins:
             if self._is_cancelled():
@@ -934,17 +923,16 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             self._reset_file(timeout_note)
 
             self.logger.log(Level.INFO, "Preparing plugin {0}".format(plugin_name))
-            progressBar.progress("Preparing " + plugin_name)
+            ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME, "Preparing " + plugin_name))
             plugin_success = True
             plugin_timeout = False
 
             self.logger.log(Level.INFO, "Running plugin {0} (jsonl)".format(plugin_name))
-            progressBar.progress("Running " + plugin_name + " (jsonl)")
+            ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME, "Running " + plugin_name + " (jsonl)"))
             json_result = self.runner.run_plugin(dump_path, plugin_name, "jsonl", json_path, stderr_json_tmp, self.timeout_sec, self._is_cancelled)
             self._append_log(stderr_json_tmp, stderr_final, "[JSONL] " + plugin_name)
             current_step += 1
             progressBar.progress(current_step)
-            progressBar.progress("Completed " + plugin_name + " (jsonl)")
             if json_result.cancelled:
                 self.logger.log(Level.INFO, "Processing cancelled during plugin " + plugin_name)
                 return DataSourceIngestModule.ProcessResult.OK
@@ -960,12 +948,11 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 self.logger.log(Level.WARNING, "Error during plugin {0} (jsonl): {1}".format(plugin_name, json_result.error))
 
             self.logger.log(Level.INFO, "Running plugin {0} (text)".format(plugin_name))
-            progressBar.progress("Running " + plugin_name + " (text)")
+            ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME, "Running " + plugin_name + " (text)"))
             txt_result = self.runner.run_plugin(dump_path, plugin_name, "text", txt_path, stderr_txt_tmp, self.timeout_sec, self._is_cancelled)
             self._append_log(stderr_txt_tmp, stderr_final, "[TEXT] " + plugin_name)
             current_step += 1
             progressBar.progress(current_step)
-            progressBar.progress("Completed " + plugin_name + " (text)")
             if txt_result.cancelled:
                 self.logger.log(Level.INFO, "Processing cancelled during plugin " + plugin_name)
                 return DataSourceIngestModule.ProcessResult.OK
@@ -980,13 +967,22 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 plugin_success = False
                 self.logger.log(Level.WARNING, "Error during plugin {0} (text): {1}".format(plugin_name, txt_result.error))
 
-            progressBar.progress("Finished " + plugin_name)
+            status_message = "Finished " + plugin_name
+            if plugin_success and not plugin_timeout:
+                status_message += " (success)"
+            elif plugin_timeout:
+                status_message += " (timeout)"
+            else:
+                status_message += " (issues)"
+            ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME, status_message))
             if plugin_timeout:
                 self.timeout_count += 1
             if plugin_success:
                 self.success_count += 1
             else:
                 self.failure_count += 1
+
+        progressBar.progress(total_steps)
         summary = "Volatility 3 finished for {0}. Success: {1}, Failed: {2}, Timed out: {3}. Output: {4}".format(
             dataSource.getName(), self.success_count, self.failure_count, self.timeout_count,
             self.report_root_dir.getAbsolutePath())
@@ -1028,8 +1024,13 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
 
     def _detect_operating_system(self, dump_path):
         for entry in OS_DETECTION_SEQUENCE:
+            self.logger.log(Level.INFO, "OS detection attempt using {0}".format(entry[1]))
             os_key, plugin_name, renderer = entry
             result = self.runner.run_detection(dump_path, plugin_name, renderer, min(120, self.timeout_sec), self._is_cancelled)
+            if result.error is not None:
+                self.logger.log(Level.WARNING, "Detection {0} error: {1}".format(plugin_name, result.error))
+            else:
+                self.logger.log(Level.INFO, "Detection {0} exit code: {1}".format(plugin_name, result.exit_code))
             if result.cancelled:
                 return None
             if result.timed_out:
@@ -1174,6 +1175,9 @@ class Vol3IngestModuleFactory(IngestModuleFactoryAdapter):
             else:
                 settings = Vol3JobSettings()
         return Vol3DataSourceIngestModule(settings)
+
+
+
 
 
 
