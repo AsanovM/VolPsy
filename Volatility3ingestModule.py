@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import os
 import sys
 import json
@@ -1394,7 +1394,7 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 self._create_derived_file(dataSource, plugin_name, txt_path)
             except Exception:
                 pass
-            # Post TXT as a blackboard artifact (best‑effort)
+            # Post TXT as a blackboard artifact (bestР Р†Р вЂљРІР‚Вeffort)
             try:
                 json_count = self._count_lines(json_path)
             except Exception:
@@ -1687,7 +1687,9 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                     base = parts[-1]
             except Exception:
                 base = plugin_name
-            fileName = base
+            # Ensure a readable extension so Autopsy opens in Text viewer
+            # e.g., "pslist" -> "pslist.txt" instead of an extensionless name
+            fileName = base + ".txt"
             # Copy TXT into CaseDirectory/DerivedFiles/Volatility3 so Autopsy can read it reliably
             caseDir = Case.getCurrentCase().getCaseDirectory()
             destDir = File(File(caseDir, "DerivedFiles"), "Volatility3")
@@ -1701,15 +1703,28 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             inBr = None
             outBw = None
             try:
-                inBr = BufferedReader(InputStreamReader(FileInputStream(src), "UTF-8"))
-                outBw = BufferedWriter(OutputStreamWriter(FileOutputStream(destFile), "UTF-8"))
-                while True:
-                    line = inBr.readLine()
-                    if line is None:
-                        break
-                    outBw.write(line)
-                    outBw.write("\n")
-                outBw.flush()
+            inSt = FileInputStream(src)
+            outSt = FileOutputStream(destFile)
+            try:
+                if ApacheIOUtils is not None:
+                    ApacheIOUtils.copy(inSt, outSt)
+                else:
+                    buf = _jbytes(8192, 'b')
+                    while True:
+                        n = inSt.read(buf)
+                        if n == -1:
+                            break
+                        outSt.write(buf, 0, n)
+                outSt.flush()
+            finally:
+                try:
+                    outSt.close()
+                except Exception:
+                    pass
+                try:
+                    inSt.close()
+                except Exception:
+                    pass
             finally:
                 try:
                     if inBr is not None:
@@ -1726,7 +1741,7 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             parent = dataSource
             sk = Case.getCurrentCase().getSleuthkitCase()
             details = u"Volatility plugin: " + plugin_name
-            localPath = destFile.getAbsolutePath().replace('\\', '/')
+            localPath = destFile.getAbsolutePath()
             # Prefer registering as a local file for best viewer compatibility
             try:
                 lf = sk.addLocalFile(destFile.getName(), size, ts, ts, ts, ts, True,
@@ -1782,6 +1797,20 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             a_path = self._bb_attr('TSK_PATH') or self._bb_attr('TSK_FILE_PATH')
             if a_path is not None and txt_path is not None:
                 attrs.append(BlackboardAttribute(a_path, MODULE_NAME, txt_path))
+            # Embed a short text preview so results are readable from Analysis Results
+            try:
+                preview_attr = self._bb_attr('TSK_TEXT')
+                if preview_attr is None:
+                    preview_attr = self._bb_attr('TSK_DESCRIPTION')
+                if preview_attr is not None and txt_path is not None:
+                    # Read up to 100 KB to avoid oversized artifacts
+                    sample = self._read_text(txt_path)
+                    if sample is not None and len(sample) > 0:
+                        if len(sample) > 100 * 1024:
+                            sample = sample[:100 * 1024] + u"\n... (truncated)"
+                        attrs.append(BlackboardAttribute(preview_attr, MODULE_NAME, sample))
+            except Exception:
+                pass
             for a in attrs:
                 try:
                     art.addAttribute(a)
@@ -2227,3 +2256,4 @@ class Vol3IngestModuleFactory(IngestModuleFactoryAdapter):
         except Exception:
             pass
         return module
+
