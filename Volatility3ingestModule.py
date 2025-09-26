@@ -270,42 +270,42 @@ class _StreamCollector(object):
     def __init__(self, input_stream, target_path, max_bytes, append_mode):
         self.input_stream = input_stream
         self.target_path = target_path
-        self.max_bytes = max_bytes
+        self.max_bytes = max_bytes if max_bytes is not None else 0
         self.append_mode = append_mode
         self.truncated = False
         self.error = None
 
     def run(self):
-        writer = None
-        reader = None
+        out_stream = None
         try:
             if self.target_path is not None:
                 file_obj = File(self.target_path)
                 parent = file_obj.getParentFile()
                 if parent is not None and not parent.exists():
                     parent.mkdirs()
-                writer = BufferedWriter(OutputStreamWriter(FileOutputStream(file_obj, self.append_mode), "UTF-8"))
-            reader = BufferedReader(InputStreamReader(self.input_stream, "UTF-8"))
+                out_stream = BufferedOutputStream(FileOutputStream(file_obj, self.append_mode))
+            buf = _jbytes(8192, 'b')
             total = 0
             while True:
-                line = reader.readLine()
-                if line is None:
+                n = self.input_stream.read(buf)
+                if n == -1:
                     break
-                encoded = (line + "\n").encode("UTF-8")
-                total += len(encoded)
-                if self.max_bytes > 0 and total > self.max_bytes:
-                    self.truncated = True
-                    if writer is not None:
-                        writer.write(u"[vol3] Output truncated (exceeded configured limit)\n")
-                        writer.flush()
-                    while reader.readLine() is not None:
-                        pass
-                    break
-                if writer is not None:
-                    writer.write(line)
-                    writer.write("\n")
-            if writer is not None:
-                writer.flush()
+                if out_stream is not None:
+                    if self.max_bytes > 0 and (total + n) > self.max_bytes:
+                        remain = self.max_bytes - total
+                        if remain > 0:
+                            out_stream.write(buf, 0, remain)
+                            total += remain
+                        self.truncated = True
+                        # Drain the rest without writing
+                        while self.input_stream.read(buf) != -1:
+                            pass
+                        break
+                    else:
+                        out_stream.write(buf, 0, n)
+                        total += n
+            if out_stream is not None:
+                out_stream.flush()
         except Exception as ex:
             self.error = str(ex)
         finally:
@@ -313,14 +313,9 @@ class _StreamCollector(object):
                 self.input_stream.close()
             except Exception:
                 pass
-            if reader is not None:
+            if out_stream is not None:
                 try:
-                    reader.close()
-                except Exception:
-                    pass
-            if writer is not None:
-                try:
-                    writer.close()
+                    out_stream.close()
                 except Exception:
                     pass
 
@@ -1583,8 +1578,8 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                         for f in files:
                             try:
                                 name = f.getName()
-                                rel = "txt/" + name
-                                bw.write("<li><a href='" + rel + "'>" + name + "</a> (" + str(f.length()) + " bytes)</li>")
+                                href = f.toURI().toString()
+                                bw.write("<li><a href='" + href + "'>" + name + "</a> (" + str(f.length()) + " bytes)</li>")
                             except Exception:
                                 pass
                     bw.write("</ul>")
@@ -1596,8 +1591,8 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                         for f in files:
                             try:
                                 name = f.getName()
-                                rel = "json/" + name
-                                bw.write("<li><a href='" + rel + "'>" + name + "</a> (" + str(f.length()) + " bytes)</li>")
+                                href = f.toURI().toString()
+                                bw.write("<li><a href='" + href + "'>" + name + "</a> (" + str(f.length()) + " bytes)</li>")
                             except Exception:
                                 pass
                     bw.write("</ul>")
@@ -1609,8 +1604,8 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                         for f in files:
                             try:
                                 name = f.getName()
-                                rel = "logs/" + name
-                                bw.write("<li><a href='" + rel + "'>" + name + "</a> (" + str(f.length()) + " bytes)</li>")
+                                href = f.toURI().toString()
+                                bw.write("<li><a href='" + href + "'>" + name + "</a> (" + str(f.length()) + " bytes)</li>")
                             except Exception:
                                 pass
                     bw.write("</ul>")
@@ -1699,13 +1694,14 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             idx = 0
             while destFile.exists() and idx < 100:
                 idx += 1
-                destFile = File(destDir, fileName + "_" + str(idx))
-            inBr = None
-            outBw = None
+                # Use base_#.txt rather than txt_# suffix after extension
+                destFile = File(destDir, base + "_" + str(idx) + ".txt")
+            # Initialize streams and copy file into DerivedFiles/Volatility3
+            inSt = None
+            outSt = None
             try:
-            inSt = FileInputStream(src)
-            outSt = FileOutputStream(destFile)
-            try:
+                inSt = FileInputStream(src)
+                outSt = FileOutputStream(destFile)
                 if ApacheIOUtils is not None:
                     ApacheIOUtils.copy(inSt, outSt)
                 else:
@@ -1716,24 +1712,20 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                             break
                         outSt.write(buf, 0, n)
                 outSt.flush()
-            finally:
+            except Exception as e:
                 try:
-                    outSt.close()
-                except Exception:
-                    pass
-                try:
-                    inSt.close()
+                    self.logger.log(Level.WARNING, "Failed to copy TXT to DerivedFiles: {0}".format(unicode(e)))
                 except Exception:
                     pass
             finally:
                 try:
-                    if inBr is not None:
-                        inBr.close()
+                    if outSt is not None:
+                        outSt.close()
                 except Exception:
                     pass
                 try:
-                    if outBw is not None:
-                        outBw.close()
+                    if inSt is not None:
+                        inSt.close()
                 except Exception:
                     pass
             size = destFile.length()
@@ -1741,36 +1733,82 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             parent = dataSource
             sk = Case.getCurrentCase().getSleuthkitCase()
             details = u"Volatility plugin: " + plugin_name
-            localPath = destFile.getAbsolutePath()
-            # Prefer registering as a local file for best viewer compatibility
+            localPathAbs = destFile.getAbsolutePath()
+            # For addDerivedFile, Autopsy 4.21 expects a path relative to the case directory.
+            # Build a safe relative path like "DerivedFiles/Volatility3/name.txt".
             try:
-                lf = sk.addLocalFile(destFile.getName(), size, ts, ts, ts, ts, True,
-                                      localPath, None, None, None, "text/plain", parent)
-                if lf is not None:
-                    return lf
+                caseDirFile = File(caseDir)
+                relUri = caseDirFile.toURI().relativize(destFile.toURI())
+                localPathRel = relUri.getPath()
+                if localPathRel is None or len(localPathRel) == 0:
+                    localPathRel = destFile.getName()
+            except Exception:
+                localPathRel = destFile.getName()
+            # Also compute a relative path to the original ModuleOutput TXT, so we can
+            # fallback to referencing it directly if registering the copied file fails.
+            srcLocalRel = None
+            try:
+                srcFile = File(src_path)
+                caseDirFile = File(caseDir)
+                relUri2 = caseDirFile.toURI().relativize(srcFile.toURI())
+                srcLocalRel = relUri2.getPath()
+            except Exception:
+                srcLocalRel = None
+            try:
+                _safe_debug_log(u"[derived] prepared file: {0} (size={1})".format(localPathAbs, size))
             except Exception:
                 pass
-            # Fallback to derived file if addLocalFile is unavailable
+            # Register strictly as a derived file that references the on-disk copy
+            # under CaseDirectory/DerivedFiles/Volatility3 so entries appear in File Views.
             derived = None
             for attempt in range(0, 3):
-                candidate = destFile.getName() if attempt == 0 else (destFile.getName() + "_" + str(attempt))
+                candidate = destFile.getName() if attempt == 0 else (base + "_" + str(attempt) + ".txt")
                 try:
-                    derived = sk.addDerivedFile(candidate, localPath, size,
+                    derived = sk.addDerivedFile(candidate, localPathRel, size,
                                                 ts, ts, ts, ts, True, parent,
                                                 details, MODULE_NAME, MODULE_VERSION, "",
                                                 TskData.TSK_FS_NAME_TYPE_ENUM.REG, TskData.TSK_FS_META_TYPE_ENUM.REG,
                                                 None, 0, None, SleuthkitCase.EncodingType.NONE)
                     if derived is not None:
+                        try:
+                            _safe_debug_log(u"[derived] addDerivedFile registered: " + derived.getName())
+                        except Exception:
+                            pass
                         break
                 except Exception:
                     try:
-                        derived = sk.addDerivedFile(candidate, localPath, size,
+                        derived = sk.addDerivedFile(candidate, localPathRel, size,
                                                     ts, ts, ts, ts, True, parent,
                                                     details, MODULE_NAME, MODULE_VERSION, "")
                         if derived is not None:
                             break
                     except Exception:
                         derived = None
+            # Fallback: if registering the copy failed, try registering the ModuleOutput TXT directly
+            if derived is None and srcLocalRel is not None:
+                try:
+                    _safe_debug_log(u"[derived] primary registration failed, trying ModuleOutput path: " + srcLocalRel)
+                except Exception:
+                    pass
+                for attempt in range(0, 3):
+                    candidate = destFile.getName() if attempt == 0 else (base + "_" + str(attempt) + ".txt")
+                    try:
+                        derived = sk.addDerivedFile(candidate, srcLocalRel, File(src_path).length(),
+                                                    ts, ts, ts, ts, True, parent,
+                                                    details, MODULE_NAME, MODULE_VERSION, "",
+                                                    TskData.TSK_FS_NAME_TYPE_ENUM.REG, TskData.TSK_FS_META_TYPE_ENUM.REG,
+                                                    None, 0, None, SleuthkitCase.EncodingType.NONE)
+                        if derived is not None:
+                            break
+                    except Exception:
+                        try:
+                            derived = sk.addDerivedFile(candidate, srcLocalRel, File(src_path).length(),
+                                                        ts, ts, ts, ts, True, parent,
+                                                        details, MODULE_NAME, MODULE_VERSION, "")
+                            if derived is not None:
+                                break
+                        except Exception:
+                            derived = None
             return derived
         except Exception:
             return None
@@ -2256,4 +2294,5 @@ class Vol3IngestModuleFactory(IngestModuleFactoryAdapter):
         except Exception:
             pass
         return module
+
 
