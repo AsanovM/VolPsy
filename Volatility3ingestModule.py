@@ -9,6 +9,7 @@ import time
 from java.io import File, FileInputStream, BufferedReader, InputStreamReader, FileOutputStream, OutputStreamWriter, BufferedWriter, IOException
 from java.lang import ProcessBuilder, System
 from java.util.logging import Level
+from java.util import ArrayList
 from java.util.concurrent import Executors, TimeUnit, TimeoutException, Callable
 
 from javax.swing import (JPanel, JCheckBox, JLabel, JTextField, JButton, JScrollPane,
@@ -1052,6 +1053,55 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
         self.vol_exe = ""
         self.reports_root_setting = ""
         self.errors_summary_path = None
+        # Temporary exports to clean up (e.g., extracted memory image)
+        self._temp_exports = []
+        # Cache for created/located 'Volatility3' directories per data source id
+        self._vol_dir_cache = {}
+        self._current_vol_dir = None
+        # Registration mode for outputs: 'derived' (default), 'local', or 'both'
+        self.register_mode = 'derived'
+
+    def _add_local_file_robust(self, sk, parent, name, size, ts, path, mime):
+        # Tries multiple SleuthkitCase.addLocalFile signatures across versions
+        # Returns AbstractFile or None
+        try:
+            # 14-arg variant with EncodingType at end
+            try:
+                lf = sk.addLocalFile(name, size, ts, ts, ts, ts, True,
+                                     path, None, None, None, mime, parent,
+                                     SleuthkitCase.EncodingType.NONE)
+                if lf is not None:
+                    return lf
+            except Exception:
+                pass
+            # 14-arg variant with EncodingType before mime/parent (alternative ordering)
+            try:
+                lf = sk.addLocalFile(name, size, ts, ts, ts, ts, True,
+                                     path, None, None, None,
+                                     SleuthkitCase.EncodingType.NONE, mime, parent)
+                if lf is not None:
+                    return lf
+            except Exception:
+                pass
+            # 11-arg variant: omit hashes and mime
+            try:
+                lf = sk.addLocalFile(name, size, ts, ts, ts, ts, True,
+                                     path, parent)
+                if lf is not None:
+                    return lf
+            except Exception:
+                pass
+            # 12-arg variant: include mime only
+            try:
+                lf = sk.addLocalFile(name, size, ts, ts, ts, ts, True,
+                                     path, mime, parent)
+                if lf is not None:
+                    return lf
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return None
 
     def startUp(self, context):
         _safe_debug_log("[ingest] startUp() entered")
@@ -1129,6 +1179,37 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
         if min_mb <= 0:
             min_mb = 8
         self.min_candidate_bytes = min_mb * 1024 * 1024
+
+        # Whether to attach outputs as a separate Local Files data source
+        try:
+            attach_cfg = self.config.get("output", "attach_as_data_source", "false")
+        except Exception:
+            attach_cfg = "false"
+        try:
+            self.attach_as_ds = (attach_cfg is not None) and (attach_cfg.strip().lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            self.attach_as_ds = False
+        try:
+            _safe_debug_log(u"[ingest] attach_as_ds setting: " + (u"true" if self.attach_as_ds else u"false"))
+        except Exception:
+            pass
+
+        # Read registration mode for file visibility handling
+        try:
+            reg_mode = self.config.get("output", "register_mode", "derived")
+        except Exception:
+            reg_mode = "derived"
+        try:
+            reg_mode_l = (reg_mode or "").strip().lower()
+            if reg_mode_l not in ("derived", "local", "both"):
+                reg_mode_l = "derived"
+            self.register_mode = reg_mode_l
+        except Exception:
+            self.register_mode = "derived"
+        try:
+            _safe_debug_log(u"[ingest] register_mode: " + self.register_mode)
+        except Exception:
+            pass
 
         extra_opts = self._build_extra_opts()
         self.runner = Vol3Runner(self.logger, self.python_exe, self.vol_exe, self.timeout_sec, self.max_stdout_bytes, extra_opts, launch_mode)
@@ -1361,6 +1442,14 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             if txt_result.error is not None:
                 plugin_success = False
                 self.logger.log(Level.WARNING, "Error during plugin {0} (pretty): {1}".format(plugin_name, txt_result.error))
+            # Ensure TXT exists and is non-empty
+            try:
+                _f = File(txt_path)
+                if _f is None or (not _f.exists()) or _f.length() == 0:
+                    self._ensure_file_has_message(txt_path, "no output")
+            except Exception:
+                pass
+            # Do not add TXT to Reports here; TXT will be attached under the data source instead
 
             status_message = "Finished " + plugin_name
             if plugin_success and not plugin_timeout:
@@ -1384,12 +1473,32 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 self.success_count += 1
             else:
                 self.failure_count += 1
-            # Create a derived file in the data source root (no extension, no OS prefix)
-            try:
-                self._create_derived_file(dataSource, plugin_name, txt_path)
-            except Exception:
-                pass
-            # Post TXT as a blackboard artifact (bestР Р†Р вЂљРІР‚Вeffort)
+            # Register outputs under current Data Source only if not attaching as a separate DS
+            if not getattr(self, 'attach_as_ds', True):
+                try:
+                    _safe_debug_log(u"[ingest] per-plugin registration under DS for: " + plugin_name)
+                except Exception:
+                    pass
+                try:
+                    # Skip if a file with the same name already exists in the data source
+                    base_name = self._sanitize_plugin_name(plugin_name).split(".")[-1] + ".txt"
+                    _df = self._create_derived_file(dataSource, plugin_name, txt_path)
+                    if _df is None:
+                        try:
+                            self._register_local_txt(dataSource, File(txt_path))
+                        except Exception:
+                            pass
+                except Exception:
+                    try:
+                        self._register_local_txt(dataSource, File(txt_path))
+                    except Exception:
+                        pass
+            else:
+                try:
+                    _safe_debug_log(u"[ingest] deferring registration; will attach as separate DS")
+                except Exception:
+                    pass
+            # Post TXT as a blackboard artifact (best-effort)
             try:
                 json_count = self._count_lines(json_path)
             except Exception:
@@ -1399,6 +1508,100 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             except Exception:
                 pass
 
+            # Fallback: if pslist/pstree returned no records, try psscan (best-effort)
+            try:
+                need_fb = False
+                if plugin_name in ("windows.pslist", "windows.pstree"):
+                    # Empty JSONL or empty TXT implies nothing rendered
+                    need_fb = (json_count is None) or (json_count <= 0)
+                    try:
+                        txt_file_chk = File(txt_path)
+                        if txt_file_chk is None or (not txt_file_chk.exists()) or (txt_file_chk.length() == 0):
+                            need_fb = True
+                    except Exception:
+                        pass
+                if need_fb:
+                    try:
+                        suffix = plugin_name.split(".")[-1] if "." in plugin_name else plugin_name
+                    except Exception:
+                        suffix = "orig"
+                    fb_label = u"windows.psscan (fallback for {0})".format(suffix)
+                    fb_safe = self._sanitize_plugin_name("windows.psscan_for_" + suffix)
+                    fb_json = File(self.json_dir, fb_safe + ".jsonl").getAbsolutePath()
+                    fb_txt = File(self.txt_dir, fb_safe + ".txt").getAbsolutePath()
+                    fb_stderr_final = File(self.logs_dir, fb_safe + ".stderr.txt").getAbsolutePath()
+                    fb_stderr_json_tmp = File(self.logs_dir, fb_safe + ".stderr.json.tmp").getAbsolutePath()
+                    fb_stderr_txt_tmp = File(self.logs_dir, fb_safe + ".stderr.text.tmp").getAbsolutePath()
+                    fb_timeout = File(self.logs_dir, fb_safe + ".timeout.txt").getAbsolutePath()
+                    # Reset output files
+                    for p in (fb_json, fb_txt, fb_stderr_final, fb_stderr_json_tmp, fb_stderr_txt_tmp, fb_timeout):
+                        try:
+                            self._reset_file(p)
+                        except Exception:
+                            pass
+                    ingest_services.postMessage(IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME,
+                                              u"Running fallback: psscan for {0}".format(plugin_name)))
+                    # Run JSONL
+                    fb_success = True
+                    fb_timed_out = False
+                    fb_json_res = self.runner.run_plugin(dump_path, "windows.psscan", "jsonl", fb_json, fb_stderr_json_tmp, self.timeout_sec, self._is_cancelled)
+                    self._record_error(fb_label, "jsonl", fb_stderr_json_tmp, fb_json_res)
+                    self._append_log(fb_stderr_json_tmp, fb_stderr_final, "[JSONL] " + fb_label)
+                    if fb_json_res.cancelled:
+                        return DataSourceIngestModule.ProcessResult.OK
+                    if fb_json_res.timed_out:
+                        fb_timed_out = True
+                        fb_success = False
+                        self._write_timeout(fb_timeout, fb_label, "jsonl")
+                    if fb_json_res.exit_code != 0 or fb_json_res.error is not None:
+                        fb_success = False
+                    # Run pretty
+                    fb_txt_res = self.runner.run_plugin(dump_path, "windows.psscan", "pretty", fb_txt, fb_stderr_txt_tmp, self.timeout_sec, self._is_cancelled)
+                    self._record_error(fb_label, "pretty", fb_stderr_txt_tmp, fb_txt_res)
+                    self._append_log(fb_stderr_txt_tmp, fb_stderr_final, "[PRETTY] " + fb_label)
+                    if fb_txt_res.cancelled:
+                        return DataSourceIngestModule.ProcessResult.OK
+                    if fb_txt_res.timed_out:
+                        fb_timed_out = True
+                        fb_success = False
+                        self._write_timeout(fb_timeout, fb_label, "pretty")
+                    if fb_txt_res.exit_code != 0 or fb_txt_res.error is not None:
+                        fb_success = False
+                    # Register and post artifact
+                    try:
+                        fb_json_count = self._count_lines(fb_json)
+                    except Exception:
+                        fb_json_count = -1
+                    try:
+                        self._create_derived_file(dataSource, fb_label, fb_txt)
+                    except Exception:
+                        pass
+                    try:
+                        self._post_txt_artifact(dataSource, fb_label, fb_txt, fb_json_count, fb_success, fb_timed_out)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Attach outputs either under current DS or as a dedicated Local Files DS
+        if getattr(self, 'attach_as_ds', True):
+            created_ok = False
+            try:
+                created_ok = self._attach_outputs_as_data_source(dataSource)
+            except Exception:
+                created_ok = False
+            if not created_ok:
+                # Fallback to registering under current DS to avoid losing outputs
+                try:
+                    self._sync_all_txt_to_fileset(dataSource)
+                except Exception:
+                    pass
+        else:
+            # Final sweep to register any TXT not yet added to File Views under current DS
+            try:
+                self._sync_all_txt_to_fileset(dataSource)
+            except Exception:
+                pass
         progressBar.progress(total_steps)
         summary = "Volatility 3 finished for {0}. Success: {1}, Failed: {2}, Timed out: {3}. Output: {4}".format(
             dataSource.getName(), self.success_count, self.failure_count, self.timeout_count,
@@ -1407,6 +1610,10 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
         self.logger.log(Level.INFO, summary)
         try:
             _safe_debug_log(u"[ingest] process() completed: " + summary)
+        except Exception:
+            pass
+        try:
+            self._cleanup_temp_exports()
         except Exception:
             pass
         return DataSourceIngestModule.ProcessResult.OK
@@ -1504,15 +1711,23 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                 pass
         if best is None:
             return None
-        # Export to a temporary local file
+        # Export under the case directory (ModuleOutput/Volatility3/tmp) and track for cleanup
         try:
-            tmp = File.createTempFile("vol3_image_", ".img")
-            tmp_path = tmp.getAbsolutePath()
-            tmp.delete()
-            _safe_debug_log(u"[ingest] exporting candidate: " + best.getName() + u" -> " + tmp_path)
-            if not self._export_abstract_file(best, tmp):
+            caseDir = Case.getCurrentCase().getCaseDirectory()
+            baseOut = File(File(caseDir, "ModuleOutput"), "Volatility3")
+            tmpDir = File(baseOut, "tmp")
+            if not tmpDir.exists():
+                tmpDir.mkdirs()
+            fname = "vol3_image_" + unicode(System.currentTimeMillis()) + ".img"
+            outFile = File(tmpDir, fname)
+            _safe_debug_log(u"[ingest] exporting candidate: " + best.getName() + u" -> " + outFile.getAbsolutePath())
+            if not self._export_abstract_file(best, outFile):
                 return None
-            return tmp_path
+            try:
+                self._temp_exports.append(outFile.getAbsolutePath())
+            except Exception:
+                pass
+            return outFile.getAbsolutePath()
         except Exception as ex:
             self.logger.log(Level.WARNING, "Export of candidate image failed: " + unicode(ex))
             return None
@@ -1560,6 +1775,211 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                     out_stream.close()
             except Exception:
                 pass
+
+    def _sync_all_txt_to_fileset(self, dataSource):
+        try:
+            if self.txt_dir is None:
+                return
+            files = self.txt_dir.listFiles()
+            if files is None:
+                return
+            for f in files:
+                try:
+                    n = f.getName()
+                    if n is None or not n.lower().endswith(".txt"):
+                        continue
+                    plugin_guess = n[:-4]
+                    # Skip if something with the same base already present (exact or with suffix _N)
+                    try:
+                        base = plugin_guess
+                        if self._is_already_registered(dataSource, base + ".txt"):
+                            try:
+                                _safe_debug_log(u"[sync] already registered exact: " + base + ".txt")
+                            except Exception:
+                                pass
+                            continue
+                        # Loose check: any name starting with base + "_"
+                        if self._is_already_registered(dataSource, base + "_"):
+                            try:
+                                _safe_debug_log(u"[sync] already registered with suffix: " + base + "_*")
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        _safe_debug_log(u"[sync] attempting register: " + f.getAbsolutePath())
+                    except Exception:
+                        pass
+                    created = self._create_derived_file(dataSource, plugin_guess, f.getAbsolutePath())
+                    if created is None:
+                        # Direct local registration as a last resort
+                        try:
+                            _safe_debug_log(u"[sync] derived failed; fallback to addLocalFile for: " + f.getAbsolutePath())
+                        except Exception:
+                            pass
+                        try:
+                            self._register_local_txt(dataSource, f)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            _safe_debug_log(u"[sync] registered ok: " + created.getName())
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _cleanup_temp_exports(self):
+        try:
+            if self._temp_exports is None:
+                return
+            for p in list(self._temp_exports):
+                try:
+                    f = File(p)
+                    if f.exists():
+                        try:
+                            f.delete()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            self._temp_exports = []
+        except Exception:
+            pass
+
+    def _attach_outputs_as_data_source(self, original_ds):
+        # Create a separate Local Files data source with all TXT outputs
+        try:
+            if self.txt_dir is None or not self.txt_dir.exists():
+                return False
+            files = self.txt_dir.listFiles()
+            if files is None or len(files) == 0:
+                return False
+            path_list = ArrayList()
+            file_list = ArrayList()
+            count = 0
+            for f in files:
+                try:
+                    if f is None or not f.exists():
+                        continue
+                    n = f.getName()
+                    if n is None or not n.lower().endswith('.txt'):
+                        continue
+                    # Prefer non-empty files first
+                    path_list.add(f.getAbsolutePath())
+                    file_list.add(f)
+                    count += 1
+                except Exception:
+                    pass
+            if count == 0:
+                return False
+            caseObj = Case.getCurrentCase()
+            ds_name = u"Volatility3 Output (" + (original_ds.getName() if original_ds is not None else u"DS") + u")"
+            device_id = u"vol3-output-" + unicode(int(time.time()))
+            tz = None
+            try:
+                # Some builds expose Case.getTimeZone()
+                tz = caseObj.getTimeZone()
+            except Exception:
+                tz = "UTC"
+            # Try common method signatures
+            ds_created = False
+            try:
+                caseObj.addLocalFilesDataSource(path_list, tz, ds_name, device_id)
+                ds_created = True
+            except Exception:
+                try:
+                    _safe_debug_log(u"[attach-ds] addLocalFilesDataSource(List<String>) failed; trying List<File>")
+                except Exception:
+                    pass
+                try:
+                    caseObj.addLocalFilesDataSource(file_list, tz, ds_name, device_id)
+                    ds_created = True
+                except Exception:
+                    try:
+                        _safe_debug_log(u"[attach-ds] addLocalFilesDataSource(List<File>) failed; trying UTC string")
+                    except Exception:
+                        pass
+                    try:
+                        # Some versions take java.util.List and java.util.TimeZone; fall back to UTC string
+                        caseObj.addLocalFilesDataSource(path_list, "UTC", ds_name, device_id)
+                        ds_created = True
+                    except Exception:
+                        # Try alternative ordering (name, deviceId, list, tz)
+                        try:
+                            _safe_debug_log(u"[attach-ds] addLocalFilesDataSource(List,String) failed; trying alt ordering")
+                        except Exception:
+                            pass
+                        try:
+                            caseObj.addLocalFilesDataSource(ds_name, device_id, path_list, tz)
+                            ds_created = True
+                        except Exception:
+                            try:
+                                _safe_debug_log(u"[attach-ds] alt ordering with List<String> failed; trying List<File>")
+                            except Exception:
+                                pass
+                            try:
+                                caseObj.addLocalFilesDataSource(ds_name, device_id, file_list, tz)
+                                ds_created = True
+                            except Exception:
+                                try:
+                                    caseObj.addLocalFilesDataSource(ds_name, device_id, path_list, "UTC")
+                                    ds_created = True
+                                except Exception:
+                                    try:
+                                        _safe_debug_log(u"[attach-ds] all attempts to add Local Files DS failed")
+                                    except Exception:
+                                        pass
+                                    ds_created = False
+            if ds_created:
+                try:
+                    IngestServices.getInstance().postMessage(
+                        IngestMessage.createMessage(IngestMessage.MessageType.INFO, MODULE_NAME,
+                            u"Attached Volatility3 outputs as Local Files data source: " + ds_name))
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _register_local_txt(self, dataSource, file_obj):
+        # Adds a TXT directly as LocalFile under the data source
+        try:
+            if file_obj is None:
+                return None
+            name = file_obj.getName()
+            size = file_obj.length()
+            ts = long(file_obj.lastModified() / 1000) if file_obj.lastModified() > 0 else 0
+            path = file_obj.getAbsolutePath()
+            sk = Case.getCurrentCase().getSleuthkitCase()
+            # Prefer to place under the 'Volatility3' directory for this data source
+            try:
+                parent = self._get_or_create_vol_dir(dataSource)
+            except Exception:
+                parent = dataSource
+            for i in range(0, 5):
+                candidate = name if i == 0 else (name[:-4] + "_" + str(i) + ".txt")
+                try:
+                    lf = self._add_local_file_robust(sk, parent, candidate, size, ts, path, "text/plain")
+                    if lf is not None:
+                        try:
+                            _safe_debug_log(u"[local] register fallback addLocalFile: " + lf.getName())
+                        except Exception:
+                            pass
+                        return lf
+                except Exception as ex:
+                    try:
+                        _safe_debug_log(u"[local] register fallback addLocalFile error (attempt {0}): ".format(i) + unicode(ex))
+                    except Exception:
+                        pass
+                    continue
+        except Exception:
+            pass
+        return None
 
     def postProcess(self, progressBar):
         try:
@@ -1674,16 +2094,18 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             src = File(src_path)
             if not src.exists():
                 return None
-            # Strip OS prefix: windows.netscan -> netscan
-            base = plugin_name
+            # Ensure/locate a 'Volatility3' directory under the data source to attach files (cached)
+            parent = self._get_or_create_vol_dir(dataSource)
             try:
-                if "." in plugin_name:
-                    parts = plugin_name.split(".")
-                    base = parts[-1]
+                _safe_debug_log(u"[derived] parent for DS '{0}': {1}".format(dataSource.getName(), parent.getName() if parent is not None else u"<none>"))
             except Exception:
-                base = plugin_name
-            # Ensure a readable extension so Autopsy opens in Text viewer
-            # e.g., "pslist" -> "pslist.txt" instead of an extensionless name
+                pass
+            # Use the full sanitized plugin name to keep names unique and consistent
+            # e.g., windows.pslist -> windows.pslist.txt (avoids collisions across plugins)
+            try:
+                base = self._sanitize_plugin_name(plugin_name)
+            except Exception:
+                base = plugin_name.replace("/", "_").replace("\\", "_")
             fileName = base + ".txt"
             # Copy TXT into CaseDirectory/DerivedFiles/Volatility3 so Autopsy can read it reliably
             caseDir = Case.getCurrentCase().getCaseDirectory()
@@ -1694,7 +2116,7 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             idx = 0
             while destFile.exists() and idx < 100:
                 idx += 1
-                # Use base_#.txt rather than txt_# suffix after extension
+                # Use base_#.txt to ensure uniqueness across runs
                 destFile = File(destDir, base + "_" + str(idx) + ".txt")
             # Initialize streams and copy file into DerivedFiles/Volatility3
             inSt = None
@@ -1730,7 +2152,18 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                     pass
             size = destFile.length()
             ts = long(destFile.lastModified() / 1000) if destFile.lastModified() > 0 else 0
-            parent = dataSource
+            # If configured to register as LocalFile only, do it now for guaranteed visibility
+            try:
+                if getattr(self, 'register_mode', 'derived') == 'local':
+                    try:
+                        lf = self._register_local_txt(dataSource, destFile)
+                        if lf is not None:
+                            return lf
+                    except Exception:
+                        pass
+                    # If local registration failed, fall through to legacy derived path
+            except Exception:
+                pass
             sk = Case.getCurrentCase().getSleuthkitCase()
             details = u"Volatility plugin: " + plugin_name
             localPathAbs = destFile.getAbsolutePath()
@@ -1774,15 +2207,27 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                             _safe_debug_log(u"[derived] addDerivedFile registered: " + derived.getName())
                         except Exception:
                             pass
-                        break
-                except Exception:
+                            break
+                except Exception as ex:
+                    try:
+                        _safe_debug_log(u"[derived] addDerivedFile (enums) error (attempt {0}): ".format(attempt) + unicode(ex))
+                    except Exception:
+                        pass
                     try:
                         derived = sk.addDerivedFile(candidate, localPathRel, size,
                                                     ts, ts, ts, ts, True, parent,
                                                     details, MODULE_NAME, MODULE_VERSION, "")
                         if derived is not None:
+                            try:
+                                _safe_debug_log(u"[derived] addDerivedFile (legacy) registered: " + derived.getName())
+                            except Exception:
+                                pass
                             break
-                    except Exception:
+                    except Exception as ex2:
+                        try:
+                            _safe_debug_log(u"[derived] addDerivedFile (legacy) error (attempt {0}): ".format(attempt) + unicode(ex2))
+                        except Exception:
+                            pass
                         derived = None
             # Fallback: if registering the copy failed, try registering the ModuleOutput TXT directly
             if derived is None and srcLocalRel is not None:
@@ -1799,16 +2244,134 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
                                                     TskData.TSK_FS_NAME_TYPE_ENUM.REG, TskData.TSK_FS_META_TYPE_ENUM.REG,
                                                     None, 0, None, SleuthkitCase.EncodingType.NONE)
                         if derived is not None:
+                            try:
+                                _safe_debug_log(u"[derived] addDerivedFile (src path) registered: " + derived.getName())
+                            except Exception:
+                                pass
                             break
-                    except Exception:
+                    except Exception as ex3:
+                        try:
+                            _safe_debug_log(u"[derived] addDerivedFile (src path, enums) error (attempt {0}): ".format(attempt) + unicode(ex3))
+                        except Exception:
+                            pass
                         try:
                             derived = sk.addDerivedFile(candidate, srcLocalRel, File(src_path).length(),
                                                         ts, ts, ts, ts, True, parent,
                                                         details, MODULE_NAME, MODULE_VERSION, "")
                             if derived is not None:
+                                try:
+                                    _safe_debug_log(u"[derived] addDerivedFile (src path, legacy) registered: " + derived.getName())
+                                except Exception:
+                                    pass
                                 break
-                        except Exception:
+                        except Exception as ex4:
+                            try:
+                                _safe_debug_log(u"[derived] addDerivedFile (src path, legacy) error (attempt {0}): ".format(attempt) + unicode(ex4))
+                            except Exception:
+                                pass
                             derived = None
+            # Last-chance: register as LocalFile so it at least appears under File Views
+            if derived is None:
+                try:
+                    _safe_debug_log(u"[derived] derived registration failed; trying addLocalFile")
+                except Exception:
+                    pass
+                try:
+                    lf = self._add_local_file_robust(sk, parent, destFile.getName(), size, ts,
+                                                     localPathAbs, "text/plain")
+                    if lf is not None:
+                        try:
+                            _safe_debug_log(u"[derived] addLocalFile(copy) registered: " + lf.getName())
+                        except Exception:
+                            pass
+                        return lf
+                except Exception as ex5:
+                    try:
+                        _safe_debug_log(u"[derived] addLocalFile(copy) error: " + unicode(ex5))
+                    except Exception:
+                        pass
+                    try:
+                        # If copy didn't succeed, point to source ModuleOutput file directly
+                        srcAbs = File(src_path).getAbsolutePath()
+                        lf = self._add_local_file_robust(sk, parent, destFile.getName(), File(src_path).length(), ts,
+                                                         srcAbs, "text/plain")
+                        if lf is not None:
+                            try:
+                                _safe_debug_log(u"[derived] addLocalFile(src) registered: " + lf.getName())
+                            except Exception:
+                                pass
+                            return lf
+                    except Exception as ex6:
+                        try:
+                            _safe_debug_log(u"[derived] addLocalFile(src) error: " + unicode(ex6))
+                        except Exception:
+                            pass
+                        pass
+            else:
+                # Verify presence in File Views under DS; if not clear, attempt LocalFile fallback
+                try:
+                    fm = Case.getCurrentCase().getServices().getFileManager()
+                    present = False
+                    try:
+                        # Broader query, then inspect parent path to confirm it resides under a Volatility3 dir
+                        foundX = fm.findFiles(dataSource, derived.getName(), "%")
+                        if foundX is not None:
+                            it = foundX
+                            # Support both Python list and Java List
+                            try:
+                                iterable = it if hasattr(it, '__iter__') else [it]
+                            except Exception:
+                                iterable = [it]
+                            for af in iterable:
+                                try:
+                                    p = af.getParentPath()
+                                    # Parent path can be '/Volatility3' or contain it; do a case-insensitive check
+                                    if p is not None and u"volatility3" in p.lower():
+                                        present = True
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        present = False
+                    if not present:
+                        try:
+                            _safe_debug_log(u"[verify] Not visible under Volatility3; adding LocalFile copy: " + derived.getName())
+                        except Exception:
+                            pass
+                        try:
+                            lf = self._add_local_file_robust(sk, parent, derived.getName(), size, ts, localPathAbs, "text/plain")
+                            if lf is not None:
+                                try:
+                                    _safe_debug_log(u"[verify] LocalFile(copy) registered: " + lf.getName())
+                                except Exception:
+                                    pass
+                                return lf
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # If mode is 'both', also add an explicit LocalFile entry, using a safe suffix to avoid collision
+                try:
+                    if getattr(self, 'register_mode', 'derived') == 'both':
+                        try:
+                            base_only = destFile.getName()
+                            # Try a few deterministic alternate names
+                            alt_names = [base_only, base + u"_local.txt", base + u"_copy.txt", base + u"_view.txt"]
+                            for nm in alt_names:
+                                try:
+                                    lf = self._add_local_file_robust(sk, parent, nm, size, ts, localPathAbs, "text/plain")
+                                    if lf is not None:
+                                        try:
+                                            _safe_debug_log(u"[both] Added LocalFile alongside Derived: " + lf.getName())
+                                        except Exception:
+                                            pass
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             return derived
         except Exception:
             return None
@@ -1870,6 +2433,10 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
 
     def shutDown(self):
         self.logger.log(Level.INFO, "Volatility 3 ingest module shutdown")
+        try:
+            self._cleanup_temp_exports()
+        except Exception:
+            pass
 
     def _is_cancelled(self):
         if self.context is None:
@@ -1889,12 +2456,166 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             target = File(base, "Volatility3")
             target.mkdirs()
             return target
-        base = File(reports_root)
-        if not base.exists():
-            base.mkdirs()
-        target = File(base, "Volatility3")
-        target.mkdirs()
-        return target
+    def _get_or_create_vol_dir(self, dataSource):
+        # Returns a stable 'Volatility3' directory under the given data source.
+        # Caches by data source id to avoid creating duplicates.
+        try:
+            # Reuse same object within one process() invocation
+            try:
+                if self._current_vol_dir is not None:
+                    return self._current_vol_dir
+            except Exception:
+                pass
+            ds_id = None
+            try:
+                ds_id = dataSource.getId()
+            except Exception:
+                ds_id = None
+            if ds_id is not None and ds_id in self._vol_dir_cache:
+                self._current_vol_dir = self._vol_dir_cache[ds_id]
+                return self._current_vol_dir
+            # Find existing directory named 'Volatility3'
+            try:
+                fm = Case.getCurrentCase().getServices().getFileManager()
+                # Look up by directory name
+                found = fm.findFiles(dataSource, "Volatility3", "%")
+                if found is not None:
+                    for af in found:
+                        try:
+                            if af.isDir() and af.getName() == "Volatility3":
+                                if ds_id is not None:
+                                    self._vol_dir_cache[ds_id] = af
+                                self._current_vol_dir = af
+                                return self._current_vol_dir
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Prefer a real derived directory first (shows reliably under File Views)
+            sk = Case.getCurrentCase().getSleuthkitCase()
+            # Fallbacks: derived DIR (new enums, then legacy)
+            try:
+                ts = long(System.currentTimeMillis() / 1000)
+                d = sk.addDerivedFile("Volatility3", "", 0,
+                                       ts, ts, ts, ts, False, dataSource,
+                                       u"Volatility 3 output root", MODULE_NAME, MODULE_VERSION, "",
+                                       TskData.TSK_FS_NAME_TYPE_ENUM.DIR, TskData.TSK_FS_META_TYPE_ENUM.DIR,
+                                       None, 0, None, SleuthkitCase.EncodingType.NONE)
+                if d is not None:
+                    if ds_id is not None:
+                        self._vol_dir_cache[ds_id] = d
+                    self._current_vol_dir = d
+                    return self._current_vol_dir
+            except Exception:
+                try:
+                    d = sk.addDerivedFile("Volatility3", "", 0,
+                                           ts, ts, ts, ts, False, dataSource,
+                                           u"Volatility 3 output root", MODULE_NAME, MODULE_VERSION, "")
+                    if d is not None:
+                        if ds_id is not None:
+                            self._vol_dir_cache[ds_id] = d
+                        self._current_vol_dir = d
+                        return self._current_vol_dir
+                except Exception:
+                    pass
+            # Last resort: virtual directory
+            try:
+                d = sk.addVirtualDirectory("Volatility3", dataSource)
+                if d is not None:
+                    if ds_id is not None:
+                        self._vol_dir_cache[ds_id] = d
+                    self._current_vol_dir = d
+                    return self._current_vol_dir
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return dataSource
+
+    def _ensure_vol3_dir(self, dataSource):
+        # Ensure (or create) a visible directory named 'Volatility3' under the data source.
+        try:
+            fm = Case.getCurrentCase().getServices().getFileManager()
+            try:
+                # Look up by directory name
+                found = fm.findFiles(dataSource, "Volatility3", "%")
+                if found is not None:
+                    for af in found:
+                        try:
+                            if af.isDir() and af.getName() == "Volatility3":
+                                return af
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            # Not found; create a directory node via addDerivedFile (DIR)
+            sk = Case.getCurrentCase().getSleuthkitCase()
+            ts = long(System.currentTimeMillis() / 1000)
+            try:
+                d = sk.addDerivedFile("Volatility3", "", 0,
+                                      ts, ts, ts, ts, False, dataSource,
+                                      u"Volatility 3 output root", MODULE_NAME, MODULE_VERSION, "",
+                                      TskData.TSK_FS_NAME_TYPE_ENUM.DIR, TskData.TSK_FS_META_TYPE_ENUM.DIR,
+                                      None, 0, None, SleuthkitCase.EncodingType.NONE)
+                if d is not None:
+                    return d
+            except Exception:
+                try:
+                    # Older signature without enums
+                    d = sk.addDerivedFile("Volatility3", "", 0,
+                                          ts, ts, ts, ts, False, dataSource,
+                                          u"Volatility 3 output root", MODULE_NAME, MODULE_VERSION, "")
+                    if d is not None:
+                        return d
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return dataSource
+
+    def _is_already_registered(self, dataSource, name):
+        try:
+            fm = Case.getCurrentCase().getServices().getFileManager()
+            # Support a simple "prefix" check if caller passes a name ending with '_'
+            # (used by sync logic to skip items like base_1.txt, base_2.txt, ...)
+            if name is not None and name.endswith('_'):
+                prefix = name
+                try:
+                    found_all = fm.findFiles(dataSource, "%", "Volatility3")
+                except Exception:
+                    found_all = None
+                if found_all is None:
+                    return False
+                try:
+                    for af in found_all:
+                        try:
+                            n = af.getName()
+                            if n is not None and n.startswith(prefix) and n.lower().endswith('.txt'):
+                                return True
+                        except Exception:
+                            continue
+                except Exception:
+                    return False
+                return False
+
+            # Exact filename check under Volatility3 directory
+            try:
+                found = fm.findFiles(dataSource, name, "Volatility3")
+            except Exception:
+                found = None
+            if found is None:
+                return False
+            try:
+                # Java list supports size(); len() also works in Jython
+                return (len(found) > 0)
+            except Exception:
+                try:
+                    return (found.size() > 0)
+                except Exception:
+                    # If we can't determine size, assume not present to avoid false skips
+                    return False
+        except Exception:
+            return False
 
     def _detect_operating_system(self, dump_path):
         for entry in OS_DETECTION_SEQUENCE:
@@ -2294,5 +3015,9 @@ class Vol3IngestModuleFactory(IngestModuleFactoryAdapter):
         except Exception:
             pass
         return module
+
+
+
+
 
 
