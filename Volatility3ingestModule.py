@@ -1058,8 +1058,10 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
         # Cache for created/located 'Volatility3' directories per data source id
         self._vol_dir_cache = {}
         self._current_vol_dir = None
-        # Registration mode for outputs: 'derived' (default), 'local', or 'both'
-        self.register_mode = 'derived'
+        # Registration mode for outputs: 'derived', 'local' (default), or 'both'
+        self.register_mode = 'local'
+        # Always register under current Data Source, not as separate DS
+        self.attach_as_ds = False
 
     def _add_local_file_robust(self, sk, parent, name, size, ts, path, mime):
         # Tries multiple SleuthkitCase.addLocalFile signatures across versions
@@ -1180,34 +1182,15 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             min_mb = 8
         self.min_candidate_bytes = min_mb * 1024 * 1024
 
-        # Whether to attach outputs as a separate Local Files data source
+        # Force registration under current DS and LocalFile visibility
+        self.attach_as_ds = False
+        self.register_mode = 'local'
         try:
-            attach_cfg = self.config.get("output", "attach_as_data_source", "false")
-        except Exception:
-            attach_cfg = "false"
-        try:
-            self.attach_as_ds = (attach_cfg is not None) and (attach_cfg.strip().lower() in ("1", "true", "yes", "on"))
-        except Exception:
-            self.attach_as_ds = False
-        try:
-            _safe_debug_log(u"[ingest] attach_as_ds setting: " + (u"true" if self.attach_as_ds else u"false"))
+            _safe_debug_log(u"[ingest] attach_as_ds: false (forced)")
         except Exception:
             pass
-
-        # Read registration mode for file visibility handling
         try:
-            reg_mode = self.config.get("output", "register_mode", "derived")
-        except Exception:
-            reg_mode = "derived"
-        try:
-            reg_mode_l = (reg_mode or "").strip().lower()
-            if reg_mode_l not in ("derived", "local", "both"):
-                reg_mode_l = "derived"
-            self.register_mode = reg_mode_l
-        except Exception:
-            self.register_mode = "derived"
-        try:
-            _safe_debug_log(u"[ingest] register_mode: " + self.register_mode)
+            _safe_debug_log(u"[ingest] register_mode: local (forced)")
         except Exception:
             pass
 
@@ -2460,12 +2443,6 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
         # Returns a stable 'Volatility3' directory under the given data source.
         # Caches by data source id to avoid creating duplicates.
         try:
-            # Reuse same object within one process() invocation
-            try:
-                if self._current_vol_dir is not None:
-                    return self._current_vol_dir
-            except Exception:
-                pass
             ds_id = None
             try:
                 ds_id = dataSource.getId()
@@ -2532,46 +2509,7 @@ class Vol3DataSourceIngestModule(DataSourceIngestModule):
             pass
         return dataSource
 
-    def _ensure_vol3_dir(self, dataSource):
-        # Ensure (or create) a visible directory named 'Volatility3' under the data source.
-        try:
-            fm = Case.getCurrentCase().getServices().getFileManager()
-            try:
-                # Look up by directory name
-                found = fm.findFiles(dataSource, "Volatility3", "%")
-                if found is not None:
-                    for af in found:
-                        try:
-                            if af.isDir() and af.getName() == "Volatility3":
-                                return af
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-            # Not found; create a directory node via addDerivedFile (DIR)
-            sk = Case.getCurrentCase().getSleuthkitCase()
-            ts = long(System.currentTimeMillis() / 1000)
-            try:
-                d = sk.addDerivedFile("Volatility3", "", 0,
-                                      ts, ts, ts, ts, False, dataSource,
-                                      u"Volatility 3 output root", MODULE_NAME, MODULE_VERSION, "",
-                                      TskData.TSK_FS_NAME_TYPE_ENUM.DIR, TskData.TSK_FS_META_TYPE_ENUM.DIR,
-                                      None, 0, None, SleuthkitCase.EncodingType.NONE)
-                if d is not None:
-                    return d
-            except Exception:
-                try:
-                    # Older signature without enums
-                    d = sk.addDerivedFile("Volatility3", "", 0,
-                                          ts, ts, ts, ts, False, dataSource,
-                                          u"Volatility 3 output root", MODULE_NAME, MODULE_VERSION, "")
-                    if d is not None:
-                        return d
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return dataSource
+    # _ensure_vol3_dir was unused; removed to avoid confusion
 
     def _is_already_registered(self, dataSource, name):
         try:
