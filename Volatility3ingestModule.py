@@ -150,6 +150,115 @@ def _module_directory():
         return os.path.dirname(os.path.abspath(inspect.getfile(frame)))
 
 
+# -------- Persistent UI settings (case-aware fallback) --------
+def _persist_global_path():
+    try:
+        mod_dir = _module_directory()
+        res_dir = os.path.join(mod_dir, "resources")
+        try:
+            if not os.path.isdir(res_dir):
+                os.makedirs(res_dir)
+        except Exception:
+            pass
+        return os.path.join(res_dir, "vol3_ui_last.json")
+    except Exception:
+        return os.path.join(os.getcwd(), "vol3_ui_last.json")
+
+
+def _persist_case_path():
+    try:
+        caseDir = Case.getCurrentCase().getCaseDirectory()
+        baseOut = File(File(caseDir, "ModuleOutput"), "Volatility3")
+        if not baseOut.exists():
+            baseOut.mkdirs()
+        return os.path.join(baseOut.getAbsolutePath(), "vol3_ui_last.json")
+    except Exception:
+        return None
+
+
+def _load_persisted_job_settings():
+    # Prefer case-specific settings; fall back to global
+    paths = []
+    try:
+        case_p = _persist_case_path()
+        if case_p is not None:
+            paths.append(case_p)
+    except Exception:
+        pass
+    try:
+        paths.append(_persist_global_path())
+    except Exception:
+        pass
+    for p in paths:
+        try:
+            if p is None:
+                continue
+            if os.path.isfile(p):
+                with open(p, 'r') as f:
+                    return json.load(f)
+        except Exception:
+            continue
+    return None
+
+
+def _persist_job_settings(settings_obj):
+    try:
+        data = {
+            'python_exe': settings_obj.getPythonExe(),
+            'vol_exe': settings_obj.getVolatilityExe(),
+            'reports_root': settings_obj.getReportsRoot(),
+            'selected_plugins': {
+                OS_WINDOWS: settings_obj.getSelectedPlugins(OS_WINDOWS),
+                OS_LINUX: settings_obj.getSelectedPlugins(OS_LINUX),
+                OS_MAC: settings_obj.getSelectedPlugins(OS_MAC)
+            }
+        }
+        # Write to both case-specific and global locations
+        targets = []
+        try:
+            cp = _persist_case_path()
+            if cp is not None:
+                targets.append(cp)
+        except Exception:
+            pass
+        try:
+            targets.append(_persist_global_path())
+        except Exception:
+            pass
+        for t in targets:
+            try:
+                parent = os.path.dirname(t)
+                if parent and not os.path.isdir(parent):
+                    os.makedirs(parent)
+                with open(t, 'w') as f:
+                    json.dump(data, f)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _apply_persisted_to_settings(settings_obj, data):
+    try:
+        if data is None:
+            return
+        py = data.get('python_exe', '')
+        vo = data.get('vol_exe', '')
+        rr = data.get('reports_root', '')
+        if py:
+            settings_obj.setPythonExe(py)
+        if vo:
+            settings_obj.setVolatilityExe(vo)
+        if rr:
+            settings_obj.setReportsRoot(rr)
+        selected = data.get('selected_plugins', {}) or {}
+        for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
+            lst = selected.get(os_key, []) or []
+            if len(lst) > 0:
+                settings_obj.setSelectedPlugins(os_key, lst)
+    except Exception:
+        pass
+
 def _resolve_plugin_whitelist(config, os_key):
     if os_key == OS_WINDOWS:
         values = config.get_list("plugins.win", "whitelist")
@@ -697,16 +806,17 @@ class Vol3PluginPlan(object):
         return []
 
     def compute_plugins(self, detected_os):
+        # Do NOT auto-fill from defaults: show only what user selected.
         if detected_os in (OS_WINDOWS, OS_LINUX, OS_MAC):
             selected = self.settings.getSelectedPlugins(detected_os)
-            if selected is None or len(selected) == 0:
-                selected = self._default_plugins(detected_os)
+            if selected is None:
+                selected = []
             return self._dedupe(selected)
         combined = []
         for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
             selected = self.settings.getSelectedPlugins(os_key)
-            if selected is None or len(selected) == 0:
-                selected = self._default_plugins(os_key)
+            if selected is None:
+                selected = []
             for item in selected:
                 if item not in combined:
                     combined.append(item)
@@ -863,8 +973,8 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
         selection_map = {}
         for os_key in (OS_WINDOWS, OS_LINUX, OS_MAC):
             selected = settings.getSelectedPlugins(os_key)
-            if selected is None or len(selected) == 0:
-                selected = self.available_plugins.get(os_key, [])
+            if selected is None:
+                selected = []
             selection_map[os_key] = list(selected)
         self._rebuild_checkboxes(selection_map)
 
@@ -1008,6 +1118,10 @@ class Vol3SettingsPanel(IngestModuleIngestJobSettingsPanel):
                     selected.append(checkbox.getText())
             settings.setSelectedPlugins(os_key, selected)
         self._validate_paths(settings)
+        try:
+            _persist_job_settings(settings)
+        except Exception:
+            pass
         return settings
 
     def _validate_paths(self, settings):
@@ -2903,12 +3017,31 @@ class Vol3IngestModuleFactory(IngestModuleFactoryAdapter):
             _safe_debug_log("[factory] getDefaultIngestJobSettings")
         except Exception:
             pass
-        return Vol3JobSettings()
+        # Build defaults, then try to hydrate from our own persisted JSON snapshot
+        s = Vol3JobSettings()
+        try:
+            persisted = _load_persisted_job_settings()
+            _apply_persisted_to_settings(s, persisted)
+        except Exception:
+            pass
+        return s
 
     def getIngestJobSettingsPanel(self, settings):
         try:
             if settings is None:
                 settings = Vol3JobSettings()
+            else:
+                # If Autopsy failed to restore serialized settings, fall back to our persisted JSON
+                try:
+                    empty = (not settings.getPythonExe()) and (not settings.getVolatilityExe()) and (len(settings.getAllSelectedPlugins()) == 0)
+                except Exception:
+                    empty = True
+                if empty:
+                    try:
+                        persisted = _load_persisted_job_settings()
+                        _apply_persisted_to_settings(settings, persisted)
+                    except Exception:
+                        pass
             module_dir = _module_directory()
             config_path = os.path.join(module_dir, "resources", "config.ini")
             _safe_debug_log(u"[factory] getIngestJobSettingsPanel; config={0}".format(config_path))
